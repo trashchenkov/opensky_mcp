@@ -5,18 +5,41 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
-from fastmcp import FastMCP
+
+
+# -------------
+# FastMCP import
+# -------------
+try:
+    # Современный пакет FastMCP
+    from fastmcp import FastMCP
+except ImportError:
+    # Фолбэк на reference-реализацию из MCP SDK, если вдруг окружение другое
+    from mcp.server.fastmcp import FastMCP  # type: ignore
 
 
 # ---------------------------
-# Config
+# OpenSky endpoints
 # ---------------------------
 
 OPENSKY_BASE = "https://opensky-network.org/api"
-TOKEN_URL = "https://auth.opensky-network.org/auth/realms/opensky-network/protocol/openid-connect/token"
+
+# OAuth2 token endpoint (client credentials)
+TOKEN_URL = (
+    "https://auth.opensky-network.org/"
+    "auth/realms/opensky-network/protocol/openid-connect/token"
+)
 
 CLIENT_ID = os.getenv("OPENSKY_CLIENT_ID")
 CLIENT_SECRET = os.getenv("OPENSKY_CLIENT_SECRET")
+
+# Таймауты можно регулировать
+HTTP_TIMEOUT = float(os.getenv("OPENSKY_HTTP_TIMEOUT", "20"))
+
+
+# ---------------------------
+# Demo regions presets (optional)
+# ---------------------------
 
 REGIONS: Dict[str, Tuple[float, float, float, float]] = {
     "moscow": (55.20, 36.90, 56.10, 38.30),
@@ -25,24 +48,35 @@ REGIONS: Dict[str, Tuple[float, float, float, float]] = {
     "komi_wide": (58.50, 44.00, 69.20, 67.20),
 }
 
+
+# ---------------------------
+# Server
+# ---------------------------
+
 mcp = FastMCP("opensky-live")
 
 
 # ---------------------------
-# OAuth (optional)
+# OAuth cache
 # ---------------------------
 
 _token_cache: Dict[str, Any] = {"token": None, "exp": 0.0}
 
 
 async def _get_bearer_token() -> Optional[str]:
-    """Внутренний helper: получает OAuth-токен по client credentials, если они заданы."""
+    """
+    Внутренний helper:
+    - Если client_id/secret не заданы, возвращает None (анонимный режим).
+    - Иначе получает OAuth2 токен по client_credentials и кэширует его.
+    """
     if not CLIENT_ID or not CLIENT_SECRET:
         return None
 
     now = time.time()
-    if _token_cache["token"] and now < _token_cache["exp"]:
-        return _token_cache["token"]
+    token = _token_cache.get("token")
+    exp = float(_token_cache.get("exp", 0))
+    if token and now < exp:
+        return token
 
     data = {
         "grant_type": "client_credentials",
@@ -50,34 +84,77 @@ async def _get_bearer_token() -> Optional[str]:
         "client_secret": CLIENT_SECRET,
     }
 
-    async with httpx.AsyncClient(timeout=20) as client:
-        r = await client.post(TOKEN_URL, data=data)
-        r.raise_for_status()
-        payload = r.json()
+    try:
+        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
+            r = await client.post(TOKEN_URL, data=data)
+            r.raise_for_status()
+            payload = r.json()
 
-    token = payload.get("access_token")
-    expires_in = int(payload.get("expires_in", 1800))
+        token = payload.get("access_token")
+        expires_in = int(payload.get("expires_in", 1800))
 
-    _token_cache["token"] = token
-    _token_cache["exp"] = now + max(60, expires_in - 30)
-    return token
+        # небольшой буфер
+        _token_cache["token"] = token
+        _token_cache["exp"] = now + max(60, expires_in - 30)
 
+        return token
+    except Exception:
+        # Если токен не берётся — пусть дальше будет анонимный режим.
+        return None
+
+
+# ---------------------------
+# Common error formatter
+# ---------------------------
+
+def _err(where: str, kind: str, message: str, **extra: Any) -> Dict[str, Any]:
+    return {
+        "ok": False,
+        "error": {
+            "where": where,
+            "kind": kind,
+            "message": message,
+            **extra,
+        },
+    }
+
+
+# ---------------------------
+# Low-level HTTP to OpenSky with soft errors
+# ---------------------------
 
 async def _opensky_get(path: str, params: Dict[str, Any]) -> Dict[str, Any]:
-    """Внутренний helper: GET к OpenSky с опциональным Bearer-токеном."""
+    """
+    Внутренний helper:
+    Делает GET к OpenSky и возвращает:
+    - {"ok": True, "data": <json>}
+    - {"ok": False, "error": {...}}
+    """
+    url = f"{OPENSKY_BASE}{path}"
+
     token = await _get_bearer_token()
     headers = {"Accept": "application/json"}
     if token:
         headers["Authorization"] = f"Bearer {token}"
 
-    async with httpx.AsyncClient(timeout=20) as client:
-        r = await client.get(f"{OPENSKY_BASE}{path}", params=params, headers=headers)
-        r.raise_for_status()
-        return r.json()
+    try:
+        async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
+            r = await client.get(url, params=params, headers=headers)
+            r.raise_for_status()
+            return {"ok": True, "data": r.json(), "url": url, "params": params}
+    except httpx.ConnectError as e:
+        return _err("opensky", "connect_error", str(e), url=url, params=params)
+    except httpx.ReadTimeout as e:
+        return _err("opensky", "timeout", str(e), url=url, params=params)
+    except httpx.HTTPStatusError as e:
+        status = getattr(e.response, "status_code", None)
+        return _err("opensky", "http_status", str(e), status=status, url=url, params=params)
+    except Exception as e:
+        return _err("opensky", "unknown", str(e), url=url, params=params)
 
 
 # ---------------------------
-# Helpers
+# Normalization helpers
 # ---------------------------
 
 def _to_kmh(v_ms: Optional[float]) -> Optional[float]:
@@ -88,13 +165,15 @@ def _to_ft(alt_m: Optional[float]) -> Optional[float]:
 
 def _normalize_states(raw: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
-    Внутренний helper: нормализует массив states из /states/all
-    в список словарей.
+    Нормализует ответ OpenSky /states/all:
+    states — список массивов с фиксированными индексами.
+    Возвращает список объектов с понятными полями.
     """
     states = raw.get("states") or []
-    out = []
+    out: List[Dict[str, Any]] = []
 
     for s in states:
+        # Индексы OpenSky states
         icao24 = s[0]
         callsign = (s[1] or "").strip() or "UNKNOWN"
         origin_country = s[2]
@@ -124,14 +203,67 @@ def _normalize_states(raw: Dict[str, Any]) -> List[Dict[str, Any]]:
 
     return out
 
+
 async def _normalized_states_bbox(
     lamin: float, lomin: float, lamax: float, lomax: float
 ) -> Dict[str, Any]:
-    """Внутренний helper: возвращает нормализованные states по bbox."""
+    """Внутренний helper без декораторов — чтобы tool не вызывал tool."""
     params = {"lamin": lamin, "lomin": lomin, "lamax": lamax, "lomax": lomax}
     raw = await _opensky_get("/states/all", params)
-    items = _normalize_states(raw)
-    return {"bbox": params, "count": len(items), "states": items}
+
+    if not raw.get("ok"):
+        return raw
+
+    items = _normalize_states(raw["data"])
+    return {
+        "ok": True,
+        "bbox": params,
+        "count": len(items),
+        "states": items,
+    }
+
+
+async def _airspace_summary_bbox(
+    lamin: float, lomin: float, lamax: float, lomax: float, top_n: int = 5
+) -> Dict[str, Any]:
+    """Внутренний helper: сводка по bbox."""
+    data = await _normalized_states_bbox(lamin, lomin, lamax, lomax)
+
+    if not data.get("ok"):
+        return data
+
+    states = data["states"]
+
+    by_speed = sorted(
+        [s for s in states if s.get("speed_kmh") is not None],
+        key=lambda x: x["speed_kmh"],
+        reverse=True,
+    )[:top_n]
+
+    by_alt = sorted(
+        [s for s in states if s.get("alt_ft") is not None],
+        key=lambda x: x["alt_ft"],
+        reverse=True,
+    )[:top_n]
+
+    prefixes: Dict[str, int] = {}
+    for s in states:
+        cs = s.get("callsign") or "UNKNOWN"
+        p = cs[:3] if cs != "UNKNOWN" else "UNK"
+        prefixes[p] = prefixes.get(p, 0) + 1
+
+    top_prefixes = sorted(prefixes.items(), key=lambda x: x[1], reverse=True)[:top_n]
+
+    return {
+        "ok": True,
+        "bbox": data["bbox"],
+        "count": data["count"],
+        "top_by_speed": by_speed,
+        "top_by_altitude": by_alt,
+        "top_callsign_prefixes": top_prefixes,
+        "note": "Живой срез OpenSky на текущий момент.",
+        "disclaimer": "origin_country — это страна регистрации ICAO24, а не маршрут рейса.",
+    }
 
 
 # ---------------------------
@@ -144,16 +276,14 @@ def opensky_regions_catalog() -> Dict[str, Any]:
     Каталог демонстрационных регионов.
 
     Назначение:
-    - Дать агенту и пользователю готовые пресеты областей наблюдения,
-      чтобы быстро стартовать без ручного ввода координат.
-    - Каталог НЕ ограничивает пользователя: при необходимости можно
-      задавать bbox вручную в других инструментах.
+    - Быстрые пресеты bbox для показательных демо.
+    - Каталог не ограничивает пользователя: bbox можно задавать вручную.
 
     Возвращает:
-    - Список регионов с именем и bbox (lamin/lomin/lamax/lomax).
-    - Примечание о назначении каталога.
+    - regions: список объектов {name, bbox}.
     """
     return {
+        "ok": True,
         "regions": [
             {
                 "name": name,
@@ -170,26 +300,34 @@ async def opensky_live_states_bbox(
     lamin: float, lomin: float, lamax: float, lomax: float, extended: int = 0
 ) -> Dict[str, Any]:
     """
-    Живые сырые данные OpenSky в заданном прямоугольнике (bounding box).
+    Сырые живые данные OpenSky по bbox.
 
     Когда использовать:
-    - Для обучения работе с REST/JSON на «честном» ответе API.
-    - Когда важно видеть исходный формат OpenSky без обработки.
+    - Для демонстрации «честного» REST/JSON ответа.
+    - Для учебных задач по парсингу.
 
     Параметры:
-    - lamin, lomin, lamax, lomax: границы области в градусах.
-    - extended: 0 или 1. Если 1, запрашивает расширенный формат states
-      (если доступен для текущего режима доступа).
+    - lamin/lomin/lamax/lomax: границы области.
+    - extended: 0/1 — запрос расширенного формата states (если доступен).
 
     Возвращает:
-    - bbox: параметры запроса.
-    - raw: исходный ответ OpenSky /states/all.
+    - ok=true + raw исходного ответа OpenSky,
+      либо ok=false + подробная ошибка.
     """
     params: Dict[str, Any] = {"lamin": lamin, "lomin": lomin, "lamax": lamax, "lomax": lomax}
     if extended:
         params["extended"] = 1
+
     raw = await _opensky_get("/states/all", params)
-    return {"bbox": params, "raw": raw}
+    if not raw.get("ok"):
+        return raw
+
+    return {
+        "ok": True,
+        "bbox": params,
+        "raw": raw["data"],
+        "note": "Сырые данные OpenSky /states/all.",
+    }
 
 
 @mcp.tool
@@ -197,22 +335,19 @@ async def opensky_normalized_states_bbox(
     lamin: float, lomin: float, lamax: float, lomax: float
 ) -> Dict[str, Any]:
     """
-    Живые данные OpenSky в bounding box, приведённые к удобному виду.
+    Нормализованный список самолётов по bbox.
 
     Когда использовать:
-    - Для запросов пользователя «перечисли самолёты…».
-    - Для аналитических ответов, где важны скорость/высота/позывные.
-
-    Отличие от opensky_live_states_bbox:
-    - Этот инструмент нормализует индексные массивы OpenSky
-      в список объектов с понятными полями.
+    - Для запросов «перечисли самолёты над ...».
 
     Возвращает:
-    - bbox: параметры запроса.
-    - count: количество обнаруженных бортов с координатами.
-    - states: список объектов:
-      callsign, icao24, lat, lon, alt_ft, speed_kmh, track_deg,
-      on_ground, origin_country, last_contact.
+    - ok=true + bbox + count + states,
+      либо ok=false + подробная ошибка.
+
+    Поля states:
+    - callsign, icao24, origin_country, lat, lon,
+      alt_ft (может отсутствовать), speed_kmh (может отсутствовать),
+      track_deg, on_ground, last_contact.
     """
     return await _normalized_states_bbox(lamin, lomin, lamax, lomax)
 
@@ -222,61 +357,99 @@ async def opensky_airspace_summary_bbox(
     lamin: float, lomin: float, lamax: float, lomax: float, top_n: int = 5
 ) -> Dict[str, Any]:
     """
-    Краткая диспетчерская сводка по воздушной обстановке в области.
+    Диспетчерская сводка по воздушной обстановке в bbox.
 
     Когда использовать:
-    - Для вопросов «что происходит над…», «сколько самолётов…»,
-      «кто самый быстрый/высокий…».
-    - Для краткого сравнения нескольких областей.
-
-    Логика:
-    - Берёт нормализованные states по bbox.
-    - Считает общее количество.
-    - Формирует топ-N по скорости и высоте.
-    - Считает частотность префиксов позывных.
-
-    Параметры:
-    - top_n: размер списков лидеров.
+    - «что происходит над ...»
+    - «сколько самолётов ...»
+    - «кто лидеры по скорости/высоте ...»
 
     Возвращает:
-    - bbox, count,
-    - top_by_speed, top_by_altitude,
-    - top_callsign_prefixes,
-    - note о том, что это живой срез.
+    - ok=true + count + лидеры + префиксы,
+      либо ok=false + подробная ошибка.
     """
-    data = await _normalized_states_bbox(lamin, lomin, lamax, lomax)
-    states = data["states"]
+    return await _airspace_summary_bbox(lamin, lomin, lamax, lomax, top_n=top_n)
 
-    by_speed = sorted(
-        [s for s in states if s["speed_kmh"] is not None],
-        key=lambda x: x["speed_kmh"],
-        reverse=True,
-    )[:top_n]
 
-    by_alt = sorted(
-        [s for s in states if s["alt_ft"] is not None],
-        key=lambda x: x["alt_ft"],
-        reverse=True,
-    )[:top_n]
+@mcp.tool
+async def opensky_airspace_summary_region(region: str, top_n: int = 5) -> Dict[str, Any]:
+    """
+    Сводка по региону из каталога.
 
-    prefixes: Dict[str, int] = {}
-    for s in states:
-        cs = s["callsign"]
-        p = cs[:3] if cs and cs != "UNKNOWN" else "UNK"
-        prefixes[p] = prefixes.get(p, 0) + 1
+    Назначение:
+    - Удобный «шорткат» для демо-областей.
+    - Если регион неизвестен, вернёт ok=false с подсказкой.
 
-    top_prefixes = sorted(prefixes.items(), key=lambda x: x[1], reverse=True)[:top_n]
+    Параметры:
+    - region: имя из каталога opensky_regions_catalog.
+    """
+    if region not in REGIONS:
+        return _err(
+            "server",
+            "unknown_region",
+            f"Регион '{region}' не найден в каталоге.",
+            available=list(REGIONS.keys()),
+        )
 
+    lamin, lomin, lamax, lomax = REGIONS[region]
+    return await _airspace_summary_bbox(lamin, lomin, lamax, lomax, top_n=top_n)
+
+
+@mcp.tool
+async def net_healthcheck() -> Dict[str, Any]:
+    """
+    Диагностика выхода во внешний интернет из окружения MCP-сервера.
+
+    Используй, если инструменты с внешними API падают.
+    Возвращает результаты простых GET к нейтральным доменам.
+    """
+    targets = [
+        "https://example.com",
+        "https://httpbin.org/get",
+    ]
+
+    results = []
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            for url in targets:
+                try:
+                    r = await client.get(url)
+                    results.append({"url": url, "ok": True, "status": r.status_code})
+                except Exception as e:
+                    results.append({
+                        "url": url,
+                        "ok": False,
+                        "error_type": type(e).__name__,
+                        "detail": str(e),
+                    })
+        return {"ok": True, "results": results}
+    except Exception as e:
+        return _err("network", "healthcheck_failed", str(e))
+
+
+@mcp.tool
+async def opensky_healthcheck() -> Dict[str, Any]:
+    """
+    Диагностика доступности OpenSky из окружения MCP-сервера.
+
+    Делает тестовый запрос /states/all по небольшому bbox.
+    Полезно отличать проблему OpenSky от общего запрета egress.
+    """
+    params = {"lamin": 55.5, "lomin": 37.2, "lamax": 55.9, "lomax": 37.8}
+    raw = await _opensky_get("/states/all", params)
+
+    if not raw.get("ok"):
+        return raw
+
+    data = raw["data"]
     return {
-        "bbox": data["bbox"],
-        "count": data["count"],
-        "top_by_speed": by_speed,
-        "top_by_altitude": by_alt,
-        "top_callsign_prefixes": top_prefixes,
-        "note": "Живой срез OpenSky на текущий момент.",
+        "ok": True,
+        "time": data.get("time"),
+        "states_is_null": data.get("states") is None,
+        "note": "Если states_is_null=true — это может быть отсутствие покрытия в данный момент.",
     }
 
 
+
 if __name__ == "__main__":
-    # Для локального self-hosted теста по HTTP:
-    mcp.run(transport="http", host="0.0.0.0", port=8000)
+    mcp.run(transport="http", host="0.0.0.0", port=port)
