@@ -18,7 +18,6 @@ TOKEN_URL = "https://auth.opensky-network.org/auth/realms/opensky-network/protoc
 CLIENT_ID = os.getenv("OPENSKY_CLIENT_ID")
 CLIENT_SECRET = os.getenv("OPENSKY_CLIENT_SECRET")
 
-# Демо-пресеты. Их можно расширять, но они не обязательны для работы.
 REGIONS: Dict[str, Tuple[float, float, float, float]] = {
     "moscow": (55.20, 36.90, 56.10, 38.30),
     "spb": (59.50, 29.70, 60.20, 31.20),
@@ -37,7 +36,7 @@ _token_cache: Dict[str, Any] = {"token": None, "exp": 0.0}
 
 
 async def _get_bearer_token() -> Optional[str]:
-    """Return cached OAuth token if client credentials exist; else None."""
+    """Внутренний helper: получает OAuth-токен по client credentials, если они заданы."""
     if not CLIENT_ID or not CLIENT_SECRET:
         return None
 
@@ -59,14 +58,13 @@ async def _get_bearer_token() -> Optional[str]:
     token = payload.get("access_token")
     expires_in = int(payload.get("expires_in", 1800))
 
-    # небольшой буфер на истечение
     _token_cache["token"] = token
     _token_cache["exp"] = now + max(60, expires_in - 30)
-
     return token
 
 
 async def _opensky_get(path: str, params: Dict[str, Any]) -> Dict[str, Any]:
+    """Внутренний helper: GET к OpenSky с опциональным Bearer-токеном."""
     token = await _get_bearer_token()
     headers = {"Accept": "application/json"}
     if token:
@@ -85,21 +83,18 @@ async def _opensky_get(path: str, params: Dict[str, Any]) -> Dict[str, Any]:
 def _to_kmh(v_ms: Optional[float]) -> Optional[float]:
     return None if v_ms is None else v_ms * 3.6
 
-
 def _to_ft(alt_m: Optional[float]) -> Optional[float]:
     return None if alt_m is None else alt_m * 3.28084
 
-
 def _normalize_states(raw: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
-    OpenSky /states/all returns index-based arrays.
-    We'll map the stable subset we used in your demos.
+    Внутренний helper: нормализует массив states из /states/all
+    в список словарей.
     """
     states = raw.get("states") or []
     out = []
 
     for s in states:
-        # индексы по документации OpenSky states
         icao24 = s[0]
         callsign = (s[1] or "").strip() or "UNKNOWN"
         origin_country = s[2]
@@ -129,6 +124,15 @@ def _normalize_states(raw: Dict[str, Any]) -> List[Dict[str, Any]]:
 
     return out
 
+async def _normalized_states_bbox(
+    lamin: float, lomin: float, lamax: float, lomax: float
+) -> Dict[str, Any]:
+    """Внутренний helper: возвращает нормализованные states по bbox."""
+    params = {"lamin": lamin, "lomin": lomin, "lamax": lamax, "lomax": lomax}
+    raw = await _opensky_get("/states/all", params)
+    items = _normalize_states(raw)
+    return {"bbox": params, "count": len(items), "states": items}
+
 
 # ---------------------------
 # MCP tools
@@ -136,7 +140,19 @@ def _normalize_states(raw: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 @mcp.tool
 def opensky_regions_catalog() -> Dict[str, Any]:
-    """Каталог демонстрационных регионов с bounding box."""
+    """
+    Каталог демонстрационных регионов.
+
+    Назначение:
+    - Дать агенту и пользователю готовые пресеты областей наблюдения,
+      чтобы быстро стартовать без ручного ввода координат.
+    - Каталог НЕ ограничивает пользователя: при необходимости можно
+      задавать bbox вручную в других инструментах.
+
+    Возвращает:
+    - Список регионов с именем и bbox (lamin/lomin/lamax/lomax).
+    - Примечание о назначении каталога.
+    """
     return {
         "regions": [
             {
@@ -145,7 +161,7 @@ def opensky_regions_catalog() -> Dict[str, Any]:
             }
             for name, box in REGIONS.items()
         ],
-        "note": "Каталог — удобные пресеты для демо. Можно задавать bbox вручную.",
+        "note": "Пресеты для демо. При необходимости задавайте bbox вручную.",
     }
 
 
@@ -154,8 +170,20 @@ async def opensky_live_states_bbox(
     lamin: float, lomin: float, lamax: float, lomax: float, extended: int = 0
 ) -> Dict[str, Any]:
     """
-    Живые сырые данные OpenSky в заданном bounding box.
-    Использует /states/all с ограничением области.
+    Живые сырые данные OpenSky в заданном прямоугольнике (bounding box).
+
+    Когда использовать:
+    - Для обучения работе с REST/JSON на «честном» ответе API.
+    - Когда важно видеть исходный формат OpenSky без обработки.
+
+    Параметры:
+    - lamin, lomin, lamax, lomax: границы области в градусах.
+    - extended: 0 или 1. Если 1, запрашивает расширенный формат states
+      (если доступен для текущего режима доступа).
+
+    Возвращает:
+    - bbox: параметры запроса.
+    - raw: исходный ответ OpenSky /states/all.
     """
     params: Dict[str, Any] = {"lamin": lamin, "lomin": lomin, "lamax": lamax, "lomax": lomax}
     if extended:
@@ -168,11 +196,25 @@ async def opensky_live_states_bbox(
 async def opensky_normalized_states_bbox(
     lamin: float, lomin: float, lamax: float, lomax: float
 ) -> Dict[str, Any]:
-    """Живые данные OpenSky в bounding box, нормализованные в список объектов."""
-    params = {"lamin": lamin, "lomin": lomin, "lamax": lamax, "lomax": lomax}
-    raw = await _opensky_get("/states/all", params)
-    items = _normalize_states(raw)
-    return {"bbox": params, "count": len(items), "states": items}
+    """
+    Живые данные OpenSky в bounding box, приведённые к удобному виду.
+
+    Когда использовать:
+    - Для запросов пользователя «перечисли самолёты…».
+    - Для аналитических ответов, где важны скорость/высота/позывные.
+
+    Отличие от opensky_live_states_bbox:
+    - Этот инструмент нормализует индексные массивы OpenSky
+      в список объектов с понятными полями.
+
+    Возвращает:
+    - bbox: параметры запроса.
+    - count: количество обнаруженных бортов с координатами.
+    - states: список объектов:
+      callsign, icao24, lat, lon, alt_ft, speed_kmh, track_deg,
+      on_ground, origin_country, last_contact.
+    """
+    return await _normalized_states_bbox(lamin, lomin, lamax, lomax)
 
 
 @mcp.tool
@@ -180,9 +222,29 @@ async def opensky_airspace_summary_bbox(
     lamin: float, lomin: float, lamax: float, lomax: float, top_n: int = 5
 ) -> Dict[str, Any]:
     """
-    Сводка по области: количество, топ по скорости и высоте, топ префиксов позывных.
+    Краткая диспетчерская сводка по воздушной обстановке в области.
+
+    Когда использовать:
+    - Для вопросов «что происходит над…», «сколько самолётов…»,
+      «кто самый быстрый/высокий…».
+    - Для краткого сравнения нескольких областей.
+
+    Логика:
+    - Берёт нормализованные states по bbox.
+    - Считает общее количество.
+    - Формирует топ-N по скорости и высоте.
+    - Считает частотность префиксов позывных.
+
+    Параметры:
+    - top_n: размер списков лидеров.
+
+    Возвращает:
+    - bbox, count,
+    - top_by_speed, top_by_altitude,
+    - top_callsign_prefixes,
+    - note о том, что это живой срез.
     """
-    data = await opensky_normalized_states_bbox(lamin, lomin, lamax, lomax)
+    data = await _normalized_states_bbox(lamin, lomin, lamax, lomax)
     states = data["states"]
 
     by_speed = sorted(
@@ -215,6 +277,6 @@ async def opensky_airspace_summary_bbox(
     }
 
 
-
 if __name__ == "__main__":
+    # Для локального self-hosted теста по HTTP:
     mcp.run(transport="http", host="0.0.0.0", port=8000)
