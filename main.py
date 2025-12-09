@@ -270,7 +270,6 @@ async def _airspace_summary_bbox(
 # MCP tools
 # ---------------------------
 @mcp.tool
-@mcp.tool
 async def opensky_ping_plus(
     generic_url: str = "https://example.com",
 ) -> dict:
