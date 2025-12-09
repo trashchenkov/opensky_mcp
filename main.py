@@ -270,19 +270,86 @@ async def _airspace_summary_bbox(
 # MCP tools
 # ---------------------------
 @mcp.tool
-async def opensky_ping() -> dict:
+async def opensky_ping(generic_url: str = "https://example.com") -> dict:
     """
-    Мини-тест доступности OpenSky из окружения сервера.
+    Диагностика исходящего доступа из окружения MCP-сервера.
+
+    Что делает:
+    1) Проверяет общий выход в интернет через generic_url
+       (по умолчанию https://example.com).
+    2) Проверяет доступность OpenSky через /states/all на маленьком bbox.
+
+    Как читать результат:
+    - generic ok=false -> вероятно нет исходящего доступа в интернет из Cloud.
+    - generic ok=true, opensky ok=false -> интернет есть, но OpenSky
+      недоступен/заблокирован/ограничен для этого окружения.
+    - оба ok=true -> всё хорошо.
+
+    Параметры:
+    - generic_url: можно заменить на любой стабильный публичный endpoint.
     """
+    import time
     import httpx
-    url = "https://opensky-network.org/api/states/all"
-    params = {"lamin": 55.2, "lomin": 36.9, "lamax": 56.1, "lomax": 38.3}
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.get(url, params=params)
-            return {"ok": True, "status": r.status_code}
-    except Exception as e:
-        return {"ok": False, "error_type": type(e).__name__, "detail": str(e)}
+
+    results = {}
+
+    opensky_url = "https://opensky-network.org/api/states/all"
+    opensky_params = {
+        "lamin": 55.2, "lomin": 36.9,
+        "lamax": 56.1, "lomax": 38.3
+    }
+
+    async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
+        # 1) Generic интернет-пинг
+        t0 = time.time()
+        try:
+            r = await client.get(generic_url)
+            results["generic"] = {
+                "ok": True,
+                "url": generic_url,
+                "status": r.status_code,
+                "ms": int((time.time() - t0) * 1000),
+            }
+        except Exception as e:
+            results["generic"] = {
+                "ok": False,
+                "url": generic_url,
+                "error_type": type(e).__name__,
+                "detail": str(e) or "",
+            }
+
+        # 2) OpenSky-пинг
+        t1 = time.time()
+        try:
+            r = await client.get(opensky_url, params=opensky_params)
+            results["opensky"] = {
+                "ok": True,
+                "url": opensky_url,
+                "status": r.status_code,
+                "ms": int((time.time() - t1) * 1000),
+            }
+        except Exception as e:
+            results["opensky"] = {
+                "ok": False,
+                "url": opensky_url,
+                "params": opensky_params,
+                "error_type": type(e).__name__,
+                "detail": str(e) or "",
+            }
+
+    # Короткий вердикт для агента
+    if not results["generic"]["ok"]:
+        verdict = "Похоже, у MCP-сервера нет исходящего доступа в интернет (или он сильно ограничен)."
+    elif not results["opensky"]["ok"]:
+        verdict = "Интернет в целом доступен, но OpenSky недоступен из этого окружения."
+    else:
+        verdict = "И общий интернет, и OpenSky доступны из этого окружения."
+
+    return {
+        "ok": True,
+        "results": results,
+        "verdict": verdict,
+    }
 
 
 
