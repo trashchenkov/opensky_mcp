@@ -3,10 +3,10 @@ from __future__ import annotations
 import os
 import time
 from typing import Any, Dict, List, Optional, Tuple
-
+from dotenv import load_dotenv
 import httpx
 
-
+load_dotenv() 
 # -------------
 # FastMCP import
 # -------------
