@@ -269,6 +269,22 @@ async def _airspace_summary_bbox(
 # ---------------------------
 # MCP tools
 # ---------------------------
+@mcp.tool
+async def opensky_ping() -> dict:
+    """
+    Мини-тест доступности OpenSky из окружения сервера.
+    """
+    import httpx
+    url = "https://opensky-network.org/api/states/all"
+    params = {"lamin": 55.2, "lomin": 36.9, "lamax": 56.1, "lomax": 38.3}
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get(url, params=params)
+            return {"ok": True, "status": r.status_code}
+    except Exception as e:
+        return {"ok": False, "error_type": type(e).__name__, "detail": str(e)}
+
+
 
 @mcp.tool
 def opensky_regions_catalog() -> Dict[str, Any]:
