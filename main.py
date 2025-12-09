@@ -270,86 +270,150 @@ async def _airspace_summary_bbox(
 # MCP tools
 # ---------------------------
 @mcp.tool
-async def opensky_ping(generic_url: str = "https://example.com") -> dict:
+@mcp.tool
+async def opensky_ping_plus(
+    generic_url: str = "https://example.com",
+) -> dict:
     """
     Диагностика исходящего доступа из окружения MCP-сервера.
 
-    Что делает:
-    1) Проверяет общий выход в интернет через generic_url
-       (по умолчанию https://example.com).
-    2) Проверяет доступность OpenSky через /states/all на маленьком bbox.
+    Проверяет:
+    1) generic_url — общий интернет
+    2) https://opensky-network.org/ — доступность домена/статического ресурса
+    3) OAuth2 token endpoint OpenSky — только если заданы OPENSKY_CLIENT_ID/SECRET
+    4) https://opensky-network.org/api/states/all — доступность API
 
-    Как читать результат:
-    - generic ok=false -> вероятно нет исходящего доступа в интернет из Cloud.
-    - generic ok=true, opensky ok=false -> интернет есть, но OpenSky
-      недоступен/заблокирован/ограничен для этого окружения.
-    - оба ok=true -> всё хорошо.
-
-    Параметры:
-    - generic_url: можно заменить на любой стабильный публичный endpoint.
+    Как читать:
+    - generic ok=false -> вероятно нет общего egress из Cloud
+    - generic ok=true, opensky_domain ok=false -> проблема с доступом к домену OpenSky
+    - opensky_domain ok=true, opensky_api ok=false -> блок/ограничение именно API
+    - opensky_auth ok=false при наличии кредов -> проблема OAuth2 из этого окружения
     """
+
+    import os
     import time
     import httpx
 
-    results = {}
+    OPENSKY_DOMAIN_URL = "https://opensky-network.org/"
+    OPENSKY_API_URL = "https://opensky-network.org/api/states/all"
+    OPENSKY_AUTH_URL = (
+        "https://auth.opensky-network.org/auth/realms/opensky-network/"
+        "protocol/openid-connect/token"
+    )
 
-    opensky_url = "https://opensky-network.org/api/states/all"
     opensky_params = {
         "lamin": 55.2, "lomin": 36.9,
         "lamax": 56.1, "lomax": 38.3
     }
 
+    def ok_result(url: str, status: int, ms: int, extra: dict | None = None):
+        d = {"ok": True, "url": url, "status": status, "ms": ms}
+        if extra:
+            d.update(extra)
+        return d
+
+    def err_result(url: str, e: Exception, extra: dict | None = None):
+        d = {
+            "ok": False,
+            "url": url,
+            "error_type": type(e).__name__,
+            "detail": str(e) or "",
+        }
+        if extra:
+            d.update(extra)
+        return d
+
+    results = {}
+
+    client_id = os.getenv("OPENSKY_CLIENT_ID")
+    client_secret = os.getenv("OPENSKY_CLIENT_SECRET")
+
     async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
-        # 1) Generic интернет-пинг
+
+        # 1) Generic интернет
         t0 = time.time()
         try:
             r = await client.get(generic_url)
-            results["generic"] = {
-                "ok": True,
-                "url": generic_url,
-                "status": r.status_code,
-                "ms": int((time.time() - t0) * 1000),
-            }
+            results["generic"] = ok_result(generic_url, r.status_code, int((time.time()-t0)*1000))
         except Exception as e:
-            results["generic"] = {
-                "ok": False,
-                "url": generic_url,
-                "error_type": type(e).__name__,
-                "detail": str(e) or "",
-            }
+            results["generic"] = err_result(generic_url, e)
 
-        # 2) OpenSky-пинг
+        # 2) Статический ресурс OpenSky
         t1 = time.time()
         try:
-            r = await client.get(opensky_url, params=opensky_params)
-            results["opensky"] = {
-                "ok": True,
-                "url": opensky_url,
-                "status": r.status_code,
-                "ms": int((time.time() - t1) * 1000),
-            }
+            r = await client.get(OPENSKY_DOMAIN_URL)
+            results["opensky_domain"] = ok_result(OPENSKY_DOMAIN_URL, r.status_code, int((time.time()-t1)*1000))
         except Exception as e:
-            results["opensky"] = {
+            results["opensky_domain"] = err_result(OPENSKY_DOMAIN_URL, e)
+
+        # 3) OAuth2 token endpoint (если есть креды)
+        if client_id and client_secret:
+            t2 = time.time()
+            try:
+                data = {
+                    "grant_type": "client_credentials",
+                    "client_id": client_id,
+                    "client_secret": client_secret,
+                }
+                r = await client.post(
+                    OPENSKY_AUTH_URL,
+                    data=data,
+                    headers={"Content-Type": "application/x-www-form-urlencoded"},
+                )
+                results["opensky_auth"] = ok_result(
+                    OPENSKY_AUTH_URL,
+                    r.status_code,
+                    int((time.time()-t2)*1000),
+                )
+            except Exception as e:
+                results["opensky_auth"] = err_result(OPENSKY_AUTH_URL, e)
+        else:
+            results["opensky_auth"] = {
                 "ok": False,
-                "url": opensky_url,
-                "params": opensky_params,
-                "error_type": type(e).__name__,
-                "detail": str(e) or "",
+                "skipped": True,
+                "reason": "Missing OPENSKY_CLIENT_ID/OPENSKY_CLIENT_SECRET",
+                "url": OPENSKY_AUTH_URL,
             }
 
-    # Короткий вердикт для агента
-    if not results["generic"]["ok"]:
-        verdict = "Похоже, у MCP-сервера нет исходящего доступа в интернет (или он сильно ограничен)."
-    elif not results["opensky"]["ok"]:
-        verdict = "Интернет в целом доступен, но OpenSky недоступен из этого окружения."
-    else:
-        verdict = "И общий интернет, и OpenSky доступны из этого окружения."
+        # 4) API OpenSky
+        t3 = time.time()
+        try:
+            r = await client.get(OPENSKY_API_URL, params=opensky_params)
+            results["opensky_api"] = ok_result(
+                OPENSKY_API_URL,
+                r.status_code,
+                int((time.time()-t3)*1000),
+                extra={"params": opensky_params},
+            )
+        except Exception as e:
+            results["opensky_api"] = err_result(
+                OPENSKY_API_URL,
+                e,
+                extra={"params": opensky_params},
+            )
 
-    return {
-        "ok": True,
-        "results": results,
-        "verdict": verdict,
-    }
+    # Вердикт
+    if not results["generic"]["ok"]:
+        verdict = "Похоже, у сервера нет исходящего доступа в интернет."
+    elif not results["opensky_domain"]["ok"]:
+        verdict = "Интернет есть, но домен OpenSky недоступен из этого окружения."
+    elif results["opensky_auth"].get("skipped"):
+        # кредов нет — пропускаем auth-диагностику
+        if not results["opensky_api"]["ok"]:
+            verdict = "Домен OpenSky доступен, но API недоступен из этого окружения."
+        else:
+            verdict = "Интернет и OpenSky API доступны (OAuth2 не проверялся — нет кредов)."
+    else:
+        if not results["opensky_auth"]["ok"] and not results["opensky_api"]["ok"]:
+            verdict = "Домен OpenSky доступен, но auth и API недоступны из этого окружения."
+        elif not results["opensky_auth"]["ok"]:
+            verdict = "Домен и API доступны, но есть проблема с OAuth2 endpoint."
+        elif not results["opensky_api"]["ok"]:
+            verdict = "Домен и auth доступны, но API недоступен из этого окружения."
+        else:
+            verdict = "И общий интернет, и домен, и auth, и API OpenSky доступны."
+
+    return {"ok": True, "results": results, "verdict": verdict}
 
 
 
